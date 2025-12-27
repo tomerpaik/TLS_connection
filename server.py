@@ -3,8 +3,8 @@ import struct
 import os
 import time
 
-SERVER_PREFERRED_CIPHERS = [0xc02f, 0xc030, 0xc02b] # 0xC02F = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-
+#SERVER_PREFERRED_CIPHERS = [0xc02f, 0xc030, 0xc02b] # 0xC02F = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+SERVER_PREFERRED_CIPHERS = [0x002f] # TLS_RSA_WITH_AES_128_CBC_SHA
 
 def parse_client_hello(data):
     """
@@ -106,6 +106,53 @@ def build_server_hello(session_id, chosen_cipher_int):
 
     return rec_type + rec_ver + rec_len + handshake_msg
 
+def build_certificate_message():
+    """Reads server.der and builds the Certificate handshake message"""
+
+    # 1. Read the raw certificate file (DER format)
+    try:
+        with open("server.der", "rb") as f:
+            cert_data = f.read()
+    except FileExistsError:
+        print("[-] Error: server.der not found! Run the OpenSSL/Python generation script first.")
+        return None
+
+    # 2. Build Length Fields (TLS uses 3-byte integers for these)
+    l3_len = struct.pack("!I", len(cert_data))[1:]
+    total_certs_len = len(cert_data) + 3
+
+    l2_len = struct.pack("!I", total_certs_len)[1:]
+    cert_body = l2_len + l3_len + cert_data
+
+    msg_type = bytes.fromhex("0b")
+    msg_len = struct.pack("!I", len(cert_body))[1:]
+    handshake_msg = msg_type + msg_len + cert_body
+
+    rec_type = bytes.fromhex("16")  # Handshake
+    rec_ver = bytes.fromhex("0303")  # TLS 1.2
+    rec_len = struct.pack("!H", len(handshake_msg))
+
+    return rec_type + rec_ver + rec_len + handshake_msg
+
+
+def build_server_hello_done():
+    """
+    Builds the Server Hello Done message (Empty handshake message)
+    """
+    # --- Handshake Header ---
+    # Type 0x0e = Server Hello Done
+    msg_type = bytes.fromhex("0e")
+    # Length: 0 bytes (no body)
+    msg_len = bytes.fromhex("000000")
+
+    handshake_msg = msg_type + msg_len
+
+    # --- Record Header ---
+    rec_type = bytes.fromhex("16")  # Handshake
+    rec_ver = bytes.fromhex("0303")  # TLS 1.2
+    rec_len = struct.pack("!H", len(handshake_msg))
+
+    return rec_type + rec_ver + rec_len + handshake_msg
 
 def start_server():
     host = '0.0.0.0'
@@ -151,7 +198,30 @@ def start_server():
                     client.send(response)
                     print("[V] Server Hello sent successfully.")
 
-                    print("[*] Waiting 5 seconds to let curl process the data...")
+                    # 6. Send Certificate
+                    cert_packet = build_certificate_message()
+                    if cert_packet:
+                        client.send(cert_packet)
+                        print("[V] Certificate sent.")
+
+                    # 7. Send Server Hello Done
+                    done_packet = build_server_hello_done()
+                    client.send(done_packet)
+                    print("[V] Server Hello Done sent.")
+
+                    print("[*] Waiting for Client response...")
+                    client_response = client.recv(4096)
+                    if client_response:
+                        print(f"[V] Received {len(client_response)} bytes from client!")
+                        print(f"    Hex Dump: {client_response.hex()[:60]}...")
+
+                        if client_response[0] == 0x16:
+                            print("[V] It looks like a valid TLS record!")
+                    else:
+                        print("[-] Client closed connection without sending data.")
+
+                    # 8. Wait and see what happens
+                    print("[*] Waiting 5 seconds...")
                     time.sleep(5)
                 else:
                     print("[X] No shared cipher found.")
