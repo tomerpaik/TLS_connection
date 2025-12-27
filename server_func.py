@@ -1,12 +1,14 @@
 import struct
 import os
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 """
-Contains additional functions for server.py
+Contains additional functions for server.py - Protocol Handling
 """
 
-#SERVER_PREFERRED_CIPHERS = [0xc02f, 0xc030, 0xc02b] # 0xC02F = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-SERVER_PREFERRED_CIPHERS = [0x002f] # TLS_RSA_WITH_AES_128_CBC_SHA
+SERVER_PREFERRED_CIPHERS = [0xc02f] # 0xC02F = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+#SERVER_PREFERRED_CIPHERS = [0x002f] # TLS_RSA_WITH_AES_128_CBC_SHA
 
 def parse_client_hello(data):
     """
@@ -127,6 +129,56 @@ def build_certificate_message():
 
     rec_type = bytes.fromhex("16")  # Handshake
     rec_ver = bytes.fromhex("0303")  # TLS 1.2
+    rec_len = struct.pack("!H", len(handshake_msg))
+
+    return rec_type + rec_ver + rec_len + handshake_msg
+
+
+def build_server_key_exchange(client_random, server_random, ephemeral_pub_key_bytes, rsa_private_key):
+    """
+    Builds the Server Key Exchange packet (Critical for ECDHE).
+    Constructs the curve parameters and SIGNS them with the RSA private key.
+    """
+
+    # --- 1. Construct ServerECDHParams ---
+    # Curve Type: Named Curve (3)
+    curve_type = bytes([3])
+    # Named Curve: secp256r1 (0x0017)
+    named_curve = bytes.fromhex("0017")
+    # Public Key Length (1 byte)
+    pub_key_len = bytes([len(ephemeral_pub_key_bytes)])
+
+    # The actual parameters block
+    server_params = curve_type + named_curve + pub_key_len + ephemeral_pub_key_bytes
+
+    # --- 2. Create the Signature ---
+    # The signature covers: ClientRandom + ServerRandom + ServerParams
+    data_to_sign = client_random + server_random + server_params
+
+    # Sign using SHA256 and RSA (using the static server.key)
+    signature = rsa_private_key.sign(
+        data_to_sign,
+        padding.PKCS1v15(),
+        hashes.SHA256()
+    )
+
+    # --- 3. Construct the DigitallySigned struct ---
+    # Hash Algorithm: SHA256 (4), Signature Algorithm: RSA (1) -> 0x0401
+    sig_algorithm = bytes.fromhex("0401")
+    # Signature Length (2 bytes)
+    sig_len = struct.pack("!H", len(signature))
+
+    # Combine everything
+    body = server_params + sig_algorithm + sig_len + signature
+
+    # --- 4. Add Handshake & Record Headers ---
+    # Type 0x0c = Server Key Exchange
+    msg_type = bytes.fromhex("0c")
+    msg_len = struct.pack("!I", len(body))[1:]
+    handshake_msg = msg_type + msg_len + body
+
+    rec_type = bytes.fromhex("16")
+    rec_ver = bytes.fromhex("0303")
     rec_len = struct.pack("!H", len(handshake_msg))
 
     return rec_type + rec_ver + rec_len + handshake_msg

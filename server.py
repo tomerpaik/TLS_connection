@@ -7,12 +7,12 @@ import time
 import server_func
 
 # Cryptography libraries for RSA decryption
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding, ec
 
 
-def load_private_key():
-    """Loads the private key from server.key file"""
+def load_rsa_private_key():
+    """Loads the static RSA private key (for signing)"""
     try:
         with open("server.key", "rb") as key_file:
             private_key = serialization.load_pem_private_key(
@@ -21,9 +21,52 @@ def load_private_key():
             )
         return private_key
     except FileNotFoundError:
-        print("[-] Error: server.key not found. Run generation script first.")
+        print("[-] Error: server.key not found.")
         return None
 
+
+def create_ephemeral_key():
+    """
+    Generates a temporary (ephemeral) private/public key pair
+    on the curve SECP256R1.
+    """
+    # Generate private key
+    private_key = ec.generate_private_key(ec.SECP256R1())
+
+    # Serialize public key to bytes (uncompressed format) for sending
+    public_key_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint
+    )
+    return private_key, public_key_bytes
+
+def derive_shared_secret(server_ephemeral_private, client_pub_key_bytes):
+    """
+    Performs the ECDH math: (ServerPriv * ClientPub) = Shared Secret
+    """
+    try:
+        # 1. Load the client's public key from bytes
+        # ECDHE public key is usually 1 byte length + 65 bytes key (0x04 + X + Y)
+        # We assume the packet contains just the length + key.
+
+        # Extract the key part (skip the length byte)
+        key_length = client_pub_key_bytes[0]
+        actual_key_data = client_pub_key_bytes[1: 1 + key_length]
+
+        print(f"[*] Client Public Key Length: {key_length}")
+
+        client_pub_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(),
+            actual_key_data
+        )
+
+        # 2. Derive shared secret
+        shared_secret = server_ephemeral_private.exchange(ec.ECDH(), client_pub_key)
+        return shared_secret
+
+    except Exception as e:
+        print(f"[-] Key derivation failed: {e}")
+        return None
 
 def decrypt_pre_master_secret(private_key, packet_data):
     """
@@ -67,8 +110,9 @@ def start_server():
     server_socket.bind((host, port))
     server_socket.listen(1)
 
-    private_key = load_private_key()
-    if not private_key: return
+    # Load static RSA key (used ONLY for signing now!)
+    rsa_signing_key = load_rsa_private_key()
+    if not rsa_signing_key: return
 
     print("[*] Server listening on port 4433...")
 
@@ -118,42 +162,53 @@ def start_server():
                     client.send(cert_packet)
                     print("[V] Certificate sent.")
 
-                # 7. Send Server Hello Done
+                # 7. Generate Ephemeral Keys
+                emph_private, emph_public_bytes = create_ephemeral_key()
+                print("[V] Ephemeral keys generated.")
+
+                # 8. Send Server Key Exchange
+                # We send the public key, SIGNED by our RSA key
+                key_exchange_packet = server_func.build_server_key_exchange(
+                    client_random, server_random, emph_public_bytes, rsa_signing_key
+                )
+                client.send(key_exchange_packet)
+                print("[V] Server Key Exchange sent (Signed).")
+
+                # 9. Send Server Hello Done
                 done_packet = server_func.build_server_hello_done()
                 client.send(done_packet)
                 print("[V] Server Hello Done sent.")
 
-                # 8. Receive Client Key Exchange
+                # 10. Receive Client Key Exchange
                 print("[*] Waiting for Client response...")
                 client_response = client.recv(4096)
-                if client_response:
-                    print(f"[V] Received {len(client_response)} bytes from client!")
 
-                    # Check if it looks like a Handshake record (0x16)
-                    if client_response[0] == 0x16:
+                if client_response and client_response[0] == 0x16:
+                    # In ECDHE, the client sends its Public Key here (not encrypted secret)
+                    # Extract the body (skip headers)
+                    # [0:5] Record Header, [5:9] Handshake Header
+                    # Data starts at index 9 for ClientKeyExchange in ECDHE (usually)
 
-                        # --- DECRYPTION STEP ---
-                        pre_master = decrypt_pre_master_secret(private_key, client_response)
+                    # NOTE: Parsing is slightly different. The body is just length(1) + key.
+                    # We skip the headers (5 bytes Record + 4 bytes Handshake)
+                    client_pub_key_raw = client_response[9:]
 
-                        if pre_master:
-                            print("\n" + "=" * 50)
-                            print("[!!!] SUCCESS! Decrypted Pre-Master Secret [!!!]")
-                            print("=" * 50)
-                            print(f"Secret Hex: {pre_master.hex()}")
+                    # 11. Derive Shared Secret
+                    shared_secret = derive_shared_secret(emph_private, client_pub_key_raw)
 
-                            # Validation: Should start with TLS version (03 03)
-                            if pre_master[:2] == b'\x03\x03':
-                                print("[V] Secret looks valid (Version 0303 found).")
-                            else:
-                                print(f"[!] Warning: Secret starts with {pre_master[:2].hex()}")
-                        else:
-                            print("[-] Failed to decrypt secret.")
+                    if shared_secret:
+                        print("\n" + "=" * 50)
+                        print("[!!!] SUCCESS! Calculated Shared Secret (ECDHE) [!!!]")
+                        print("=" * 50)
+                        print(f"Secret Hex: {shared_secret.hex()}")
+                        print(f"Length:     {len(shared_secret)} bytes (Expect 32)")
+                    else:
+                        print("[-] Failed to derive secret.")
+
                 else:
-                    print("[-] Client closed connection without sending data.")
+                    print("[-] Invalid response from client.")
 
-                # 9. Wait briefly before closing
-                print("[*] Waiting 2 seconds...")
-                time.sleep(2)
+                time.sleep(1)
             else:
                 print("[X] No shared cipher found.")
 
