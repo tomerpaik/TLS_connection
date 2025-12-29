@@ -1,5 +1,7 @@
 import struct
 import os
+import hmac
+import hashlib
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -133,7 +135,6 @@ def build_certificate_message():
 
     return rec_type + rec_ver + rec_len + handshake_msg
 
-
 def build_server_key_exchange(client_random, server_random, ephemeral_pub_key_bytes, rsa_private_key):
     """
     Builds the Server Key Exchange packet (Critical for ECDHE).
@@ -201,3 +202,81 @@ def build_server_hello_done():
     rec_len = struct.pack("!H", len(handshake_msg))
 
     return rec_type + rec_ver + rec_len + handshake_msg
+
+def p_hash(secret, seed, length):
+    """
+    TLS 1.2 P_hash function (using SHA256).
+    Expands a secret and a seed into a block of data of 'length' bytes.
+    """
+    out = b''
+    # A(0) = seed
+    # A(i) = HMAC_hash(secret, A(i-1))
+    # P_hash = HMAC_hash(secret, A(1) + seed) + HMAC_hash(secret, A(2) + seed) + ...
+
+    current_round = seed
+    while len(out) < length:
+        # Calculate A(i)
+        current_round = hmac.new(secret, current_round, hashlib.sha256).digest()
+
+        # Calculate P_hash block
+        p = hmac.new(secret, current_round + seed, hashlib.sha256).digest()
+        out += p
+
+    return out[:length]
+
+def prf(secret, label, seed, length):
+    """
+    TLS 1.2 PRF function.
+    Combines the label and seed, then calls P_hash.
+    """
+    combined_seed = label + seed
+    return p_hash(secret, combined_seed, length)
+
+def calculate_master_secret(pre_master_secret, client_random, server_random):
+    """
+    Calculates the 48-byte Master Secret using the PRF.
+    MasterSecret = PRF(PreMaster, "master secret", ClientRandom + ServerRandom)
+    """
+    label = b"master secret"
+    seed = client_random + server_random
+    return prf(pre_master_secret, label, seed, 48)
+
+def generate_session_keys(master_secret, client_random, server_random):
+    """
+    Expands the Master Secret into session keys for AES_128_GCM_SHA256.
+    Order of generation:
+    1. Client Write MAC Key (0 bytes for GCM)
+    2. Server Write MAC Key (0 bytes for GCM)
+    3. Client Write Key (16 bytes)
+    4. Server Write Key (16 bytes)
+    5. Client Write IV (4 bytes - Implicit Part)
+    6. Server Write IV (4 bytes - Implicit Part)
+    """
+    # Key Expansion Label
+    label = b"key expansion"
+
+    # Note the order swap: ServerRandom + ClientRandom (Opposite of Master Secret!)
+    seed = server_random + client_random
+
+    # Calculate total length needed:
+    # 0 (MAC) + 0 (MAC) + 16 (Key) + 16 (Key) + 4 (IV) + 4 (IV) = 40 bytes
+    key_block = prf(master_secret, label, seed, 40)
+
+    # Slice the block
+    offset = 0
+
+    # Skip MAC keys (0 length)
+
+    client_write_key = key_block[offset: offset + 16]
+    offset += 16
+
+    server_write_key = key_block[offset: offset + 16]
+    offset += 16
+
+    client_write_iv = key_block[offset: offset + 4]
+    offset += 4
+
+    server_write_iv = key_block[offset: offset + 4]
+    offset += 4
+
+    return client_write_key, server_write_key, client_write_iv, server_write_iv

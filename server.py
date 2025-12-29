@@ -9,7 +9,7 @@ import server_func
 # Cryptography libraries for RSA decryption
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding, ec
-
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 def load_rsa_private_key():
     """Loads the static RSA private key (for signing)"""
@@ -24,16 +24,9 @@ def load_rsa_private_key():
         print("[-] Error: server.key not found.")
         return None
 
-
 def create_ephemeral_key():
-    """
-    Generates a temporary (ephemeral) private/public key pair
-    on the curve SECP256R1.
-    """
-    # Generate private key
+    """Generates a temporary (ephemeral) private/public key pair on SECP256R1."""
     private_key = ec.generate_private_key(ec.SECP256R1())
-
-    # Serialize public key to bytes (uncompressed format) for sending
     public_key_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.X962,
         format=serialization.PublicFormat.UncompressedPoint
@@ -41,65 +34,69 @@ def create_ephemeral_key():
     return private_key, public_key_bytes
 
 def derive_shared_secret(server_ephemeral_private, client_pub_key_bytes):
-    """
-    Performs the ECDH math: (ServerPriv * ClientPub) = Shared Secret
-    """
+    """Performs the ECDH math: (ServerPriv * ClientPub) = Shared Secret"""
     try:
-        # 1. Load the client's public key from bytes
-        # ECDHE public key is usually 1 byte length + 65 bytes key (0x04 + X + Y)
-        # We assume the packet contains just the length + key.
-
-        # Extract the key part (skip the length byte)
-        key_length = client_pub_key_bytes[0]
-        actual_key_data = client_pub_key_bytes[1: 1 + key_length]
-
-        print(f"[*] Client Public Key Length: {key_length}")
+        # Determine where the key starts. Usually byte 0 is length (e.g. 0x41)
+        if len(client_pub_key_bytes) == 66:
+            actual_key_data = client_pub_key_bytes[1:]
+        elif len(client_pub_key_bytes) == 65:
+            actual_key_data = client_pub_key_bytes
+        else:
+            print(f"[-] Unexpected key length: {len(client_pub_key_bytes)}")
+            return None
 
         client_pub_key = ec.EllipticCurvePublicKey.from_encoded_point(
             ec.SECP256R1(),
             actual_key_data
         )
 
-        # 2. Derive shared secret
-        shared_secret = server_ephemeral_private.exchange(ec.ECDH(), client_pub_key)
-        return shared_secret
-
+        return server_ephemeral_private.exchange(ec.ECDH(), client_pub_key)
     except Exception as e:
         print(f"[-] Key derivation failed: {e}")
         return None
 
-def decrypt_pre_master_secret(private_key, packet_data):
+
+def decrypt_gcm_record(key, iv_salt, full_record, seq_num_bytes):
     """
-    Extracts encrypted data from packet and decrypts using Private Key.
+    Decrypts a TLS 1.2 AES-GCM record.
+    Constructs the Nonce and AAD required for GCM verification.
     """
     try:
-        # Client Key Exchange Structure for RSA:
-        # [0:5] Record Header
-        # [5:9] Handshake Header
-        # [9:11] Encrypted Data Length (2 bytes)
-        # [11:] Encrypted Data itself
-        encrypted_len = struct.unpack('!H', packet_data[9:11])[0]
-        print(f"[*] Parsed Encrypted Length: {encrypted_len} bytes")
+        # full_record contains: Header (5) + ExplicitNonce (8) + Ciphertext + Tag (16)
 
-        # Skip headers to get to the Encrypted Data
-        encrypted_bytes = packet_data[11 : 11 + encrypted_len]
+        # 1. Parse Header
+        rec_type = full_record[0]
+        rec_ver = full_record[1:3]
+        rec_len = struct.unpack('!H', full_record[3:5])[0]
 
-        if len(encrypted_bytes) != private_key.key_size // 8:
-            print(f"[-] Warning: Expected {private_key.key_size // 8} bytes, got {len(encrypted_bytes)}")
+        # 2. Extract Explicit Nonce (8 bytes)
+        # Body starts at index 5. First 8 bytes of body are Explicit Nonce.
+        explicit_nonce = full_record[5: 5 + 8]
 
-        print(f"[*] Decrypting {len(encrypted_bytes)} bytes...")
+        # 3. Extract Ciphertext + Tag
+        # Everything after the explicit nonce
+        ciphertext_with_tag = full_record[5 + 8:]
 
-        # Decrypt using RSA PKCS1v15 padding
-        pre_master_secret = private_key.decrypt(
-            encrypted_bytes,
-            padding.PKCS1v15()
-        )
-        return pre_master_secret
+        # 4. Construct GCM Nonce (12 bytes)
+        # Nonce = Implicit Salt (4 bytes) + Explicit Nonce (8 bytes)
+        nonce = iv_salt + explicit_nonce
+
+        # 5. Construct AAD (Additional Authenticated Data)
+        # AAD = SeqNum + Type + Ver + Length_of_Plaintext
+        # Note: Length in AAD is NOT rec_len. It is length of plaintext.
+        # Plaintext len = Total Body len - Explicit Nonce len (8) - Tag len (16)
+        plaintext_len = rec_len - 8 - 16
+        aad_len_bytes = struct.pack('!H', plaintext_len)
+
+        aad = seq_num_bytes + bytes([rec_type]) + rec_ver + aad_len_bytes
+
+        # 6. Decrypt
+        aesgcm = AESGCM(key)
+        plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, aad)
+
+        return plaintext
     except Exception as e:
-        print(f"[-] Decryption failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        print(f"[-] GCM Decryption Error: {e}")
         return None
 
 def start_server():
@@ -110,7 +107,6 @@ def start_server():
     server_socket.bind((host, port))
     server_socket.listen(1)
 
-    # Load static RSA key (used ONLY for signing now!)
     rsa_signing_key = load_rsa_private_key()
     if not rsa_signing_key: return
 
@@ -121,24 +117,20 @@ def start_server():
         print(f"\n[*] Connection from {addr}")
 
         try:
-            # 1. Read Record Header (5 bytes)
+            # 1. Read Record Header
             header = client.recv(5)
             if not header: break
-
-            # Unpack header
             content_type, version, length = struct.unpack('!BHH', header)
 
-            if content_type != 22:  # Handshake
-                print(f"[-] Error: Expected Handshake (22), got {content_type}")
-                break
+            if content_type != 22:
+                client.close()
+                continue
 
-            # 2. Read the body
+            # 2. Read Client Hello Body
             body = client.recv(length)
-
-            # 3. Parse details (Prints everything + returns data)
             session_id, client_ciphers, client_random = server_func.parse_client_hello(body)
 
-            # 4. Logic: Choose Cipher
+            # 3. Logic: Choose Cipher
             chosen_cipher = None
             for server_c in server_func.SERVER_PREFERRED_CIPHERS:
                 if server_c in client_ciphers:
@@ -147,51 +139,40 @@ def start_server():
 
             if chosen_cipher:
                 print(f"[V] Agreed on Cipher: 0x{chosen_cipher:04x}")
-
-                # Generate Server Random (New random for each connection)
                 server_random = os.urandom(32)
 
-                # 5. Build and Send Response
-                response = server_func.build_server_hello(session_id, server_random, chosen_cipher)
-                client.send(response)
-                print("[V] Server Hello sent successfully.")
+                # 4-9. Send Server Hello, Cert, Key Exchange, Done
+                client.send(server_func.build_server_hello(session_id, server_random, chosen_cipher))
+                client.send(server_func.build_certificate_message())
 
-                # 6. Send Certificate
-                cert_packet = server_func.build_certificate_message()
-                if cert_packet:
-                    client.send(cert_packet)
-                    print("[V] Certificate sent.")
-
-                # 7. Generate Ephemeral Keys
                 emph_private, emph_public_bytes = create_ephemeral_key()
                 print("[V] Ephemeral keys generated.")
 
-                # 8. Send Server Key Exchange
-                # We send the public key, SIGNED by our RSA key
-                key_exchange_packet = server_func.build_server_key_exchange(
+                client.send(server_func.build_server_key_exchange(
                     client_random, server_random, emph_public_bytes, rsa_signing_key
-                )
-                client.send(key_exchange_packet)
+                ))
                 print("[V] Server Key Exchange sent (Signed).")
 
-                # 9. Send Server Hello Done
-                done_packet = server_func.build_server_hello_done()
-                client.send(done_packet)
+                client.send(server_func.build_server_hello_done())
                 print("[V] Server Hello Done sent.")
 
-                # 10. Receive Client Key Exchange
+                # --- 10. SMART BUFFERING START ---
                 print("[*] Waiting for Client response...")
-                client_response = client.recv(4096)
 
-                if client_response and client_response[0] == 0x16:
-                    # In ECDHE, the client sends its Public Key here (not encrypted secret)
-                    # Extract the body (skip headers)
-                    # [0:5] Record Header, [5:9] Handshake Header
-                    # Data starts at index 9 for ClientKeyExchange in ECDHE (usually)
+                raw_buffer = client.recv(4096)
 
-                    # NOTE: Parsing is slightly different. The body is just length(1) + key.
-                    # We skip the headers (5 bytes Record + 4 bytes Handshake)
-                    client_pub_key_raw = client_response[9:]
+                if not raw_buffer:
+                    print("[-] Client disconnected.")
+                    break
+
+                # --- PROCESS PACKET 1: Client Key Exchange ---
+                # Check if it looks like a Handshake record (0x16)
+                if raw_buffer[0] == 0x16:
+                    key_exchange_len = struct.unpack('!H', raw_buffer[3:5])[0]
+                    record_end = 5 + key_exchange_len
+                    key_exchange_record = raw_buffer[:record_end]
+                    remaining_buffer = raw_buffer[record_end:]
+                    client_pub_key_raw = key_exchange_record[9:]
 
                     # 11. Derive Shared Secret
                     shared_secret = derive_shared_secret(emph_private, client_pub_key_raw)
@@ -200,20 +181,88 @@ def start_server():
                         print("\n" + "=" * 50)
                         print("[!!!] SUCCESS! Calculated Shared Secret (ECDHE) [!!!]")
                         print("=" * 50)
-                        print(f"Secret Hex: {shared_secret.hex()}")
-                        print(f"Length:     {len(shared_secret)} bytes (Expect 32)")
+
+                        # 12. Calculate Master Secret
+                        master_secret = server_func.calculate_master_secret(
+                            shared_secret, client_random, server_random
+                        )
+                        print("[V] Calculated Master Secret.")
+
+                        # 13. Key Expansion
+                        c_key, s_key, c_iv, s_iv = server_func.generate_session_keys(
+                            master_secret, client_random, server_random
+                        )
+
+                        print("=" * 30)
+                        print("SESSION KEYS GENERATED")
+                        print("=" * 30)
+                        print(f"Client Write Key: {c_key.hex()}")
+                        print(f"Client Write IV:  {c_iv.hex()}")
+
+                        # --- PROCESS PACKET 2: Change Cipher Spec ---
+                        print("\n[*] Looking for Change Cipher Spec...")
+
+                        ccs_record = None
+
+                        # Check if we already have it in buffer
+                        if len(remaining_buffer) > 0:
+                            ccs_record = remaining_buffer
+                        else:
+                            ccs_record = client.recv(1024)
+
+                        if ccs_record and ccs_record[0] == 0x14:
+                            if len(ccs_record) >= 6 and ccs_record[5] == 0x01:
+                                print("[V] Client signaled: Switch to Encryption Mode!")
+
+                                # --- Packet 3: Encrypted Finished Message (THE FINAL BOSS) ---
+                                if len(ccs_record) > 6:
+                                    encrypted_msg = ccs_record[6:]
+                                    print(f"[*] Found Encrypted Handshake Message ({len(encrypted_msg)} bytes).")
+
+                                    # Define Sequence Number (0 for first encrypted packet)
+                                    seq_num = b'\x00' * 8
+
+                                    print("[*] Attempting to decrypt with AES-GCM...")
+
+                                    plaintext = decrypt_gcm_record(
+                                        c_key,  # Key
+                                        c_iv,  # Salt
+                                        encrypted_msg,
+                                        seq_num  # SeqNum for AAD
+                                    )
+
+                                    if plaintext:
+                                        print("\n" + "*" * 60)
+                                        print("   [!!!] DECRYPTION SUCCESSFUL [!!!]")
+                                        print("*" * 60)
+                                        print(f"Decrypted Hex: {plaintext.hex()}")
+                                        # Plaintext usually: 14 (Finished Type) + 00 00 0C (Length 12) + Verify Data
+                                        if plaintext[0] == 0x14:
+                                            print("[V] Content Type is 0x14 (Finished Message).")
+                                            print("[V] HANDSHAKE COMPLETED SUCCESSFULLY!")
+                                    else:
+                                        print("[-] Decryption Failed (Bad Key or Tag).")
+                                else:
+                                    print("[*] Waiting for Encrypted Finished Message...")
+                            else:
+                                print("[-] Invalid CCS Payload.")
+                        else:
+                            print(f"[-] Expected CCS (20), got {ccs_record[0] if ccs_record else 'None'}")
+
+                        time.sleep(2)  # Keep alive briefly
+
                     else:
                         print("[-] Failed to derive secret.")
-
                 else:
-                    print("[-] Invalid response from client.")
+                    print("[-] First packet was not a Handshake record.")
 
-                time.sleep(1)
             else:
                 print("[X] No shared cipher found.")
 
         except Exception as e:
             print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             client.close()
 
