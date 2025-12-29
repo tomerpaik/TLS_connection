@@ -55,7 +55,6 @@ def derive_shared_secret(server_ephemeral_private, client_pub_key_bytes):
         print(f"[-] Key derivation failed: {e}")
         return None
 
-
 def decrypt_gcm_record(key, iv_salt, full_record, seq_num_bytes):
     """
     Decrypts a TLS 1.2 AES-GCM record.
@@ -99,6 +98,7 @@ def decrypt_gcm_record(key, iv_salt, full_record, seq_num_bytes):
         print(f"[-] GCM Decryption Error: {e}")
         return None
 
+
 def start_server():
     host = '0.0.0.0'
     port = 4433
@@ -137,127 +137,128 @@ def start_server():
                     chosen_cipher = server_c
                     break
 
-            if chosen_cipher:
-                print(f"[V] Agreed on Cipher: 0x{chosen_cipher:04x}")
-                server_random = os.urandom(32)
-
-                # 4-9. Send Server Hello, Cert, Key Exchange, Done
-                client.send(server_func.build_server_hello(session_id, server_random, chosen_cipher))
-                client.send(server_func.build_certificate_message())
-
-                emph_private, emph_public_bytes = create_ephemeral_key()
-                print("[V] Ephemeral keys generated.")
-
-                client.send(server_func.build_server_key_exchange(
-                    client_random, server_random, emph_public_bytes, rsa_signing_key
-                ))
-                print("[V] Server Key Exchange sent (Signed).")
-
-                client.send(server_func.build_server_hello_done())
-                print("[V] Server Hello Done sent.")
-
-                # --- 10. SMART BUFFERING START ---
-                print("[*] Waiting for Client response...")
-
-                raw_buffer = client.recv(4096)
-
-                if not raw_buffer:
-                    print("[-] Client disconnected.")
-                    break
-
-                # --- PROCESS PACKET 1: Client Key Exchange ---
-                # Check if it looks like a Handshake record (0x16)
-                if raw_buffer[0] == 0x16:
-                    key_exchange_len = struct.unpack('!H', raw_buffer[3:5])[0]
-                    record_end = 5 + key_exchange_len
-                    key_exchange_record = raw_buffer[:record_end]
-                    remaining_buffer = raw_buffer[record_end:]
-                    client_pub_key_raw = key_exchange_record[9:]
-
-                    # 11. Derive Shared Secret
-                    shared_secret = derive_shared_secret(emph_private, client_pub_key_raw)
-
-                    if shared_secret:
-                        print("\n" + "=" * 50)
-                        print("[!!!] SUCCESS! Calculated Shared Secret (ECDHE) [!!!]")
-                        print("=" * 50)
-
-                        # 12. Calculate Master Secret
-                        master_secret = server_func.calculate_master_secret(
-                            shared_secret, client_random, server_random
-                        )
-                        print("[V] Calculated Master Secret.")
-
-                        # 13. Key Expansion
-                        c_key, s_key, c_iv, s_iv = server_func.generate_session_keys(
-                            master_secret, client_random, server_random
-                        )
-
-                        print("=" * 30)
-                        print("SESSION KEYS GENERATED")
-                        print("=" * 30)
-                        print(f"Client Write Key: {c_key.hex()}")
-                        print(f"Client Write IV:  {c_iv.hex()}")
-
-                        # --- PROCESS PACKET 2: Change Cipher Spec ---
-                        print("\n[*] Looking for Change Cipher Spec...")
-
-                        ccs_record = None
-
-                        # Check if we already have it in buffer
-                        if len(remaining_buffer) > 0:
-                            ccs_record = remaining_buffer
-                        else:
-                            ccs_record = client.recv(1024)
-
-                        if ccs_record and ccs_record[0] == 0x14:
-                            if len(ccs_record) >= 6 and ccs_record[5] == 0x01:
-                                print("[V] Client signaled: Switch to Encryption Mode!")
-
-                                # --- Packet 3: Encrypted Finished Message (THE FINAL BOSS) ---
-                                if len(ccs_record) > 6:
-                                    encrypted_msg = ccs_record[6:]
-                                    print(f"[*] Found Encrypted Handshake Message ({len(encrypted_msg)} bytes).")
-
-                                    # Define Sequence Number (0 for first encrypted packet)
-                                    seq_num = b'\x00' * 8
-
-                                    print("[*] Attempting to decrypt with AES-GCM...")
-
-                                    plaintext = decrypt_gcm_record(
-                                        c_key,  # Key
-                                        c_iv,  # Salt
-                                        encrypted_msg,
-                                        seq_num  # SeqNum for AAD
-                                    )
-
-                                    if plaintext:
-                                        print("\n" + "*" * 60)
-                                        print("   [!!!] DECRYPTION SUCCESSFUL [!!!]")
-                                        print("*" * 60)
-                                        print(f"Decrypted Hex: {plaintext.hex()}")
-                                        # Plaintext usually: 14 (Finished Type) + 00 00 0C (Length 12) + Verify Data
-                                        if plaintext[0] == 0x14:
-                                            print("[V] Content Type is 0x14 (Finished Message).")
-                                            print("[V] HANDSHAKE COMPLETED SUCCESSFULLY!")
-                                    else:
-                                        print("[-] Decryption Failed (Bad Key or Tag).")
-                                else:
-                                    print("[*] Waiting for Encrypted Finished Message...")
-                            else:
-                                print("[-] Invalid CCS Payload.")
-                        else:
-                            print(f"[-] Expected CCS (20), got {ccs_record[0] if ccs_record else 'None'}")
-
-                        time.sleep(2)  # Keep alive briefly
-
-                    else:
-                        print("[-] Failed to derive secret.")
-                else:
-                    print("[-] First packet was not a Handshake record.")
-
-            else:
+            if not chosen_cipher:
                 print("[X] No shared cipher found.")
+                continue
+
+            print(f"[V] Agreed on Cipher: 0x{chosen_cipher:04x}")
+            server_random = os.urandom(32)
+
+            # 4-9. Send Handshake Messages
+            client.send(server_func.build_server_hello(session_id, server_random, chosen_cipher))
+            client.send(server_func.build_certificate_message())
+
+            emph_private, emph_public_bytes = create_ephemeral_key()
+            print("[V] Ephemeral keys generated.")
+
+            client.send(server_func.build_server_key_exchange(
+                client_random, server_random, emph_public_bytes, rsa_signing_key
+            ))
+            print("[V] Server Key Exchange sent (Signed).")
+
+            client.send(server_func.build_server_hello_done())
+            print("[V] Server Hello Done sent.")
+
+            # --- 10. Buffer Handling ---
+            print("[*] Waiting for Client response...")
+            raw_buffer = client.recv(4096)
+
+            if not raw_buffer:
+                print("[-] Client disconnected.")
+                continue
+
+            if raw_buffer[0] != 0x16:
+                print("[-] First packet was not a Handshake record.")
+                continue
+
+            # --- PROCESS PACKET 1: Client Key Exchange ---
+            key_exchange_len = struct.unpack('!H', raw_buffer[3:5])[0]
+            record_end = 5 + key_exchange_len
+
+            key_exchange_record = raw_buffer[:record_end]
+            remaining_buffer = raw_buffer[record_end:]
+
+            client_pub_key_raw = key_exchange_record[9:]
+
+            # 11. Derive Shared Secret
+            shared_secret = derive_shared_secret(emph_private, client_pub_key_raw)
+
+            if not shared_secret:
+                print("[-] Failed to derive secret.")
+                continue
+
+            print("\n" + "=" * 50)
+            print("[!!!] SUCCESS! Calculated Shared Secret (ECDHE) [!!!]")
+            print("=" * 50)
+
+            # 12. Calculate Master Secret
+            master_secret = server_func.calculate_master_secret(
+                shared_secret, client_random, server_random
+            )
+            print("[V] Calculated Master Secret.")
+
+            # 13. Key Expansion
+            c_key, s_key, c_iv, s_iv = server_func.generate_session_keys(
+                master_secret, client_random, server_random
+            )
+
+            print("=" * 30)
+            print("SESSION KEYS GENERATED")
+            print("=" * 30)
+            print(f"Client Write Key: {c_key.hex()}")
+            print(f"Client Write IV:  {c_iv.hex()}")
+
+            # --- PROCESS PACKET 2: Change Cipher Spec ---
+            print("\n[*] Looking for Change Cipher Spec...")
+
+            ccs_record = None
+            if len(remaining_buffer) > 0:
+                ccs_record = remaining_buffer
+            else:
+                ccs_record = client.recv(1024)
+
+            # Guard Clause 4: Validate CCS Structure
+            if not ccs_record or ccs_record[0] != 0x14:
+                print(f"[-] Expected CCS (20), got {ccs_record[0] if ccs_record else 'None'}")
+                continue
+
+            # Guard Clause 5: Validate CCS Payload
+            if len(ccs_record) < 6 or ccs_record[5] != 0x01:
+                print("[-] Invalid CCS Payload.")
+                continue
+
+            print("[V] Client signaled: Switch to Encryption Mode!")
+
+            # --- PROCESS PACKET 3: Encrypted Finished Message ---
+            if len(ccs_record) <= 6:
+                print("[*] Waiting for Encrypted Finished Message...")
+                continue
+
+            encrypted_msg = ccs_record[6:]
+            print(f"[*] Found Encrypted Handshake Message ({len(encrypted_msg)} bytes).")
+
+            seq_num = b'\x00' * 8
+            print("[*] Attempting to decrypt with AES-GCM...")
+
+            plaintext = decrypt_gcm_record(
+                c_key,  # Key
+                c_iv,  # Salt
+                encrypted_msg,
+                seq_num  # SeqNum for AAD
+            )
+
+            if plaintext:
+                print("\n" + "*" * 60)
+                print("   [!!!] DECRYPTION SUCCESSFUL [!!!]")
+                print("*" * 60)
+                print(f"Decrypted Hex: {plaintext.hex()}")
+                if plaintext[0] == 0x14:
+                    print("[V] Content Type is 0x14 (Finished Message).")
+                    print("[V] HANDSHAKE COMPLETED SUCCESSFULLY!")
+            else:
+                print("[-] Decryption Failed (Bad Key or Tag).")
+
+            time.sleep(2)
 
         except Exception as e:
             print(f"Error: {e}")
