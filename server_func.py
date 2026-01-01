@@ -280,3 +280,14 @@ def generate_session_keys(master_secret, client_random, server_random):
     offset += 4
 
     return client_write_key, server_write_key, client_write_iv, server_write_iv
+
+def calculate_verify_data(master_secret, handshake_transcript, label_bytes):
+    """
+    Calculates the Verify Data for the Finished message.
+    Formula: PRF(MasterSecret, Label, SHA256(Transcript))
+    """
+    # 1. Hash the transcript
+    transcript_hash = hashlib.sha256(handshake_transcript).digest()
+
+    # 2. Apply PRF
+    return prf(master_secret, label_bytes, transcript_hash, 12)

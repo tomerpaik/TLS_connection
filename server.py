@@ -63,33 +63,20 @@ def decrypt_gcm_record(key, iv_salt, full_record, seq_num_bytes):
     try:
         # full_record contains: Header (5) + ExplicitNonce (8) + Ciphertext + Tag (16)
 
-        # 1. Parse Header
         rec_type = full_record[0]
         rec_ver = full_record[1:3]
         rec_len = struct.unpack('!H', full_record[3:5])[0]
 
-        # 2. Extract Explicit Nonce (8 bytes)
-        # Body starts at index 5. First 8 bytes of body are Explicit Nonce.
         explicit_nonce = full_record[5: 5 + 8]
 
-        # 3. Extract Ciphertext + Tag
-        # Everything after the explicit nonce
         ciphertext_with_tag = full_record[5 + 8:]
 
-        # 4. Construct GCM Nonce (12 bytes)
-        # Nonce = Implicit Salt (4 bytes) + Explicit Nonce (8 bytes)
         nonce = iv_salt + explicit_nonce
 
-        # 5. Construct AAD (Additional Authenticated Data)
-        # AAD = SeqNum + Type + Ver + Length_of_Plaintext
-        # Note: Length in AAD is NOT rec_len. It is length of plaintext.
-        # Plaintext len = Total Body len - Explicit Nonce len (8) - Tag len (16)
         plaintext_len = rec_len - 8 - 16
         aad_len_bytes = struct.pack('!H', plaintext_len)
 
         aad = seq_num_bytes + bytes([rec_type]) + rec_ver + aad_len_bytes
-
-        # 6. Decrypt
         aesgcm = AESGCM(key)
         plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, aad)
 
@@ -98,6 +85,74 @@ def decrypt_gcm_record(key, iv_salt, full_record, seq_num_bytes):
         print(f"[-] GCM Decryption Error: {e}")
         return None
 
+def encrypt_gcm_record(key, iv_salt, plaintext, seq_num_bytes, record_type=b'\x16'):
+    """
+    Encrypts a TLS 1.2 AES-GCM record.
+    Returns the full binary packet ready to send (Header + ExplicitNonce + Ciphertext + Tag).
+    """
+    try:
+        # 1. Generate Explicit Nonce (8 bytes)
+        # Usually a counter, but random is fine for this demo
+        explicit_nonce = os.urandom(8)
+
+        # 2. Construct GCM Nonce (12 bytes) = Salt (4) + Explicit (8)
+        nonce = iv_salt + explicit_nonce
+
+        # 3. Construct AAD
+        # AAD = SeqNum + Type + Ver + Length_of_Plaintext
+        aad_len_bytes = struct.pack('!H', len(plaintext))
+        # TLS 1.2 Version = 03 03
+        aad = seq_num_bytes + record_type + b'\x03\x03' + aad_len_bytes
+
+        # 4. Encrypt
+        aesgcm = AESGCM(key)
+        ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, aad)
+
+        # 5. Build Final Record
+        # Header: Type (1) + Ver (2) + Len (2)
+        # Len = ExplicitNonce (8) + CiphertextLen
+        total_len = len(explicit_nonce) + len(ciphertext_with_tag)
+        header = record_type + b'\x03\x03' + struct.pack('!H', total_len)
+
+        return header + explicit_nonce + ciphertext_with_tag
+
+    except Exception as e:
+        print(f"[-] Encryption Error: {e}")
+        return None
+
+def send_server_finished(client, master_secret, handshake_transcript, s_key, s_iv):
+    """
+    Orchestrates the final step:
+    1. Sends Change Cipher Spec.
+    2. Calculates Verify Data.
+    3. Encrypts and sends Server Finished.
+    """
+    print("\n[*] Sending Change Cipher Spec...")
+    # CCS: Type 20, Ver 0303, Len 0001, Val 01
+    client.send(bytes.fromhex("140303000101"))
+
+    print("[*] Calculating and Encrypting Server Finished...")
+
+    # Calculate Hash
+    verify_data = server_func.calculate_verify_data(
+        master_secret,
+        handshake_transcript,
+        b"server finished"
+    )
+
+    # Build Body: Type (20) + Len (12) + VerifyData
+    finished_body = b'\x14\x00\x00\x0c' + verify_data
+
+    # Encrypt (SeqNum is 0 because it's the first encrypted packet from server)
+    encrypted_packet = encrypt_gcm_record(
+        s_key, s_iv, finished_body, b'\x00' * 8
+    )
+
+    client.send(encrypted_packet)
+    print("[V] Encrypted Server Finished sent.")
+    print("\n" + "=" * 50)
+    print("       [!!!] HANDSHAKE COMPLETE [!!!]")
+    print("=" * 50)
 
 def start_server():
     host = '0.0.0.0'
@@ -115,6 +170,7 @@ def start_server():
     while True:
         client, addr = server_socket.accept()
         print(f"\n[*] Connection from {addr}")
+        handshake_transcript = bytearray()
 
         try:
             # 1. Read Record Header
@@ -128,6 +184,7 @@ def start_server():
 
             # 2. Read Client Hello Body
             body = client.recv(length)
+            handshake_transcript.extend(body)
             session_id, client_ciphers, client_random = server_func.parse_client_hello(body)
 
             # 3. Logic: Choose Cipher
@@ -145,18 +202,27 @@ def start_server():
             server_random = os.urandom(32)
 
             # 4-9. Send Handshake Messages
-            client.send(server_func.build_server_hello(session_id, server_random, chosen_cipher))
-            client.send(server_func.build_certificate_message())
+            sh_packet = server_func.build_server_hello(session_id, server_random, chosen_cipher)
+            client.send(sh_packet)
+            handshake_transcript.extend(sh_packet[5:])
+
+            cert_packet = server_func.build_certificate_message()
+            client.send(cert_packet)
+            handshake_transcript.extend(cert_packet[5:])
 
             emph_private, emph_public_bytes = create_ephemeral_key()
             print("[V] Ephemeral keys generated.")
 
-            client.send(server_func.build_server_key_exchange(
+            ske_packet = server_func.build_server_key_exchange(
                 client_random, server_random, emph_public_bytes, rsa_signing_key
-            ))
+            )
+            client.send(ske_packet)
+            handshake_transcript.extend(ske_packet[5:])
             print("[V] Server Key Exchange sent (Signed).")
 
-            client.send(server_func.build_server_hello_done())
+            done_packet = server_func.build_server_hello_done()
+            client.send(done_packet)
+            handshake_transcript.extend(done_packet[5:])
             print("[V] Server Hello Done sent.")
 
             # --- 10. Buffer Handling ---
@@ -176,6 +242,7 @@ def start_server():
             record_end = 5 + key_exchange_len
 
             key_exchange_record = raw_buffer[:record_end]
+            handshake_transcript.extend(key_exchange_record[5:])
             remaining_buffer = raw_buffer[record_end:]
 
             client_pub_key_raw = key_exchange_record[9:]
@@ -252,13 +319,48 @@ def start_server():
                 print("   [!!!] DECRYPTION SUCCESSFUL [!!!]")
                 print("*" * 60)
                 print(f"Decrypted Hex: {plaintext.hex()}")
+                handshake_transcript.extend(plaintext)
+                print(f"[*] Transcript collected. Length: {len(handshake_transcript)} bytes")
+
                 if plaintext[0] == 0x14:
-                    print("[V] Content Type is 0x14 (Finished Message).")
-                    print("[V] HANDSHAKE COMPLETED SUCCESSFULLY!")
+                    print("[V] Client Finished verified.")
+
+                    send_server_finished(
+                        client,
+                        master_secret,
+                        handshake_transcript,
+                        s_key,
+                        s_iv
+                    )
+
+                    # --- BONUS: Send HTTP Response (Over TLS) ---
+                    print("\n[*] Handshake complete! Reading HTTP request...")
+
+                    # 1. Read the Encrypted Application Data (The HTTP GET)
+                    encrypted_http = client.recv(4096)
+
+                    if encrypted_http:
+                        print(f"[*] Received {len(encrypted_http)} bytes of encrypted HTTP data from curl.")
+
+                        # 2. Prepare HTTP Response
+                        http_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello from Python TLS!"
+
+                        # 3. Encrypt the HTTP Response
+                        # Sequence Number is 1 (because ServerFinished was 0)
+                        server_seq_num_1 = b'\x00\x00\x00\x00\x00\x00\x00\x01'
+
+                        # TLS Application Data Type is 0x17 (23)
+                        encrypted_app_data = encrypt_gcm_record(
+                            s_key, s_iv, http_response, server_seq_num_1, record_type=b'\x17'
+                        )
+
+                        # 4. Send
+                        client.send(encrypted_app_data)
+                        print("[V] Sent Encrypted HTTP Response!")
+
+                    time.sleep(1)  # Give curl a moment to receive
             else:
                 print("[-] Decryption Failed (Bad Key or Tag).")
-
-            time.sleep(2)
 
         except Exception as e:
             print(f"Error: {e}")
@@ -270,3 +372,5 @@ def start_server():
 
 if __name__ == "__main__":
     start_server()
+
+#CMD: curl -v --insecure https://localhost:4433
