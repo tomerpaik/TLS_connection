@@ -3,18 +3,20 @@ import struct
 import os
 import time
 
-# Import the functions for the server code
+# Custom protocol logic
 import server_func
 
-# Cryptography libraries for RSA decryption
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding, ec
+# Cryptography primitives
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+#CMD: curl -v --insecure https://localhost:4433
 
 def load_rsa_private_key():
     """Loads the static RSA private key (for signing)"""
     try:
-        with open("server.key", "rb") as key_file:
+        with open("../ServerExtensions/server.key", "rb") as key_file:
             private_key = serialization.load_pem_private_key(
                 key_file.read(),
                 password=None
@@ -91,31 +93,17 @@ def encrypt_gcm_record(key, iv_salt, plaintext, seq_num_bytes, record_type=b'\x1
     Returns the full binary packet ready to send (Header + ExplicitNonce + Ciphertext + Tag).
     """
     try:
-        # 1. Generate Explicit Nonce (8 bytes)
-        # Usually a counter, but random is fine for this demo
         explicit_nonce = os.urandom(8)
-
-        # 2. Construct GCM Nonce (12 bytes) = Salt (4) + Explicit (8)
         nonce = iv_salt + explicit_nonce
 
-        # 3. Construct AAD
-        # AAD = SeqNum + Type + Ver + Length_of_Plaintext
-        aad_len_bytes = struct.pack('!H', len(plaintext))
-        # TLS 1.2 Version = 03 03
-        aad = seq_num_bytes + record_type + b'\x03\x03' + aad_len_bytes
+        aad_len = struct.pack('!H', len(plaintext))
+        aad = seq_num_bytes + record_type + b'\x03\x03' + aad_len
 
-        # 4. Encrypt
-        aesgcm = AESGCM(key)
-        ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, aad)
+        ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)
 
-        # 5. Build Final Record
-        # Header: Type (1) + Ver (2) + Len (2)
-        # Len = ExplicitNonce (8) + CiphertextLen
-        total_len = len(explicit_nonce) + len(ciphertext_with_tag)
+        total_len = len(explicit_nonce) + len(ciphertext)
         header = record_type + b'\x03\x03' + struct.pack('!H', total_len)
-
-        return header + explicit_nonce + ciphertext_with_tag
-
+        return header + explicit_nonce + ciphertext
     except Exception as e:
         print(f"[-] Encryption Error: {e}")
         return None
@@ -134,19 +122,13 @@ def send_server_finished(client, master_secret, handshake_transcript, s_key, s_i
     print("[*] Calculating and Encrypting Server Finished...")
 
     # Calculate Hash
-    verify_data = server_func.calculate_verify_data(
-        master_secret,
-        handshake_transcript,
-        b"server finished"
-    )
+    verify_data = server_func.calculate_verify_data(master_secret, handshake_transcript,b"server finished")
 
     # Build Body: Type (20) + Len (12) + VerifyData
     finished_body = b'\x14\x00\x00\x0c' + verify_data
 
     # Encrypt (SeqNum is 0 because it's the first encrypted packet from server)
-    encrypted_packet = encrypt_gcm_record(
-        s_key, s_iv, finished_body, b'\x00' * 8
-    )
+    encrypted_packet = encrypt_gcm_record(s_key, s_iv, finished_body, b'\x00' * 8)
 
     client.send(encrypted_packet)
     print("[V] Encrypted Server Finished sent.")
@@ -369,8 +351,5 @@ def start_server():
         finally:
             client.close()
 
-
 if __name__ == "__main__":
     start_server()
-
-#CMD: curl -v --insecure https://localhost:4433

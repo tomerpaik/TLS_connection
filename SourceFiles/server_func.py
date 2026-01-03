@@ -1,5 +1,4 @@
 import struct
-import os
 import hmac
 import hashlib
 from cryptography.hazmat.primitives import hashes
@@ -9,8 +8,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 Contains additional functions for server.py - Protocol Handling
 """
 
-SERVER_PREFERRED_CIPHERS = [0xc02f] # 0xC02F = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-#SERVER_PREFERRED_CIPHERS = [0x002f] # TLS_RSA_WITH_AES_128_CBC_SHA
+# TLS 1.2 Cipher Suite: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+SERVER_PREFERRED_CIPHERS = [0xc02f]
 
 def parse_client_hello(data):
     """
@@ -112,7 +111,7 @@ def build_certificate_message():
 
     # 1. Read the raw certificate file (DER format)
     try:
-        with open("server.der", "rb") as f:
+        with open("../ServerExtensions/server.der", "rb") as f:
             cert_data = f.read()
     except FileExistsError:
         print("[-] Error: server.der not found! Run the OpenSSL/Python generation script first.")
