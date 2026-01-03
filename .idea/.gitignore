@@ -1,5 +1,19 @@
-# Default ignored files
+# --- PyCharm / Editor Defaults ---
 /shelf/
 /workspace.xml
-# Editor-based HTTP Client requests
 /httpRequests/
+/dataSources/
+/dataSources.local.xml
+.idea/
+
+# --- Python Generated Files (Junk) ---
+__pycache__/
+*.pyc
+
+# --- Security & Secrets (CRITICAL) ---
+*.key
+*.der
+*.crt
+*.pem
+
+ServerExtensions/
